@@ -1,6 +1,6 @@
 use FindBin;
 use Test::More;
-use Google::Spreadsheet::Agent;
+use Google::Spreadsheet::Agent::Runner;
 
 my $conf_file = $FindBin::Bin.'/../config/agent.conf.yml';
 if (-e $conf_file) {
@@ -14,14 +14,9 @@ else {
       );
 }
 
-my $agent_name = 'instantiate';
 my $page_name = 'testing';
 my $bind_key_fields = { 'testentry' => 'test' };
 
-ok my $google_agent = Google::Spreadsheet::Agent->new(
-                   agent_name => $agent_name,
-                   page_name => $page_name,
-                   bind_key_fields => $bind_key_fields
-                 );
-isa_ok $google_agent => 'Google::Spreadsheet::Agent';
-done_testing;
+ok my $agent_runner = Google::Spreadsheet::Agent::Runner->new();
+isa_ok $agent_runner => 'Google::Spreadsheet::Agent::Runner';
+

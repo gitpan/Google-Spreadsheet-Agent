@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 3;
+use Test::More tests => 5;
 
 sub not_in_file_ok {
     my ($filename, %regex) = @_;
@@ -49,7 +49,8 @@ TODO: {
   );
 
   module_boilerplate_ok('lib/Google/Spreadsheet/Agent.pm');
-
+  module_boilerplate_ok('lib/Google/Spreadsheet/Agent/Runner.pm');
+  module_boilerplate_ok('lib/Google/Spreadsheet/Agent/DB.pm');
 
 }
 

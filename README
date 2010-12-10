@@ -98,23 +98,24 @@ with the required/optional parameters, and use the run_my method on the object t
 a subroutine reference.  The best way to accomplish this is by naming the agent for the
 goal, e.g. fooby_agent.pl would accomplish the fooby goal.  The agent can also define the
 prerequisite goals required to be completed before it can run, the number of maximum
-instances of itself that should be allowed on one node, and the other agents and processes
-which should subsume it, e.g. force it to exit until these are finished, though these are
-not required.
+instances of itself that should be allowed on one node, any other agents and processes
+which it should avoid running concurrently with, and any other agents that its functions
+subsume.
 
 RUNNERS
 
 Runners are scripts designed to be fed an ordered set of key fields and goals to be worked
-on.  There are many different types of runners that can be written.  There are two examples
-in the runner_bin directory, which can be used as is, or modified to meet other requirements.
-
-Using cron, or some other scheduling software, a well designed system of different runner
-scripts can be created which will attempt goals for every record of every page until
-they are all completed over time, but can use plans of some sort (simple collections of key-goal
-records) to temporarily influence the order in which these key-goal jobs are attempted,
-opportunistically.  This begins to approach one of the goals of subsumption programming, the concept
-of using plans instead of programs to define and prioritize a large, complex set of tasks to be 
-completed (3).
+on.  Google::Spreadsheet::Agent::Runner is a framework for creating these programs which
+programmatically work through some or all pages in a Google Spreadsheet, and run some or
+all of the possible entry-goals on a particular node.  Using cron, or some other scheduling
+software, a well designed system of different runner scripts can be created which will
+attempt goals for every record of every page until they are all completed over time, but
+can use plans of some sort (simple collections of key-goal records) to temporarily influence
+the order in which these key-goal jobs are attempted, opportunistically.  Agents and runners
+can then be spread onto multiple nodes to work in a coordinated fashion to accomplish the tasks
+specified on the same Google Spreadsheet.  This begins to approach one of the goals of
+subsumption programming, the concept of using plans instead of programs to define and
+prioritize a large, complex set of tasks to be completed (3).
 
 SCENARIOS
 
@@ -127,7 +128,7 @@ cron every hour on 6 different servers with the same script directory, and dataf
 made available using NFS.
 
 1. Basic Pipeline
-Six scripts need to run:
+Five scripts need to run:
   - taskA
   - taskB
   - taskC
@@ -193,7 +194,7 @@ taskB:
                                              'arg1' => $arg1
                                           },
                                           prerequisites => [ 'taskA' ],
-                                          subsumed_by => {
+                                          conflicts_with => {
                                                            'taskC' => 1,
                                                          }
                                           );
@@ -225,7 +226,7 @@ taskC:
                                              'arg1' => $arg1
                                           },
                                           prerequisites => [ 'taskA' ],
-                                          subsumed_by => {
+                                          conflicts_with => {
                                                            'taskB' => 1,
                                                          }
                                           );
@@ -298,6 +299,13 @@ taskE:
                                return 1;
                         });
 
+Runner:
+
+   use Google::Spreadsheet::Agent::Runner;
+
+   my $runner = Google::Spreadsheet::Agent::Runner->new();
+   $runner->run();
+
 2. Simple Human Computational Workflow
 
 A field called taskA_passes_qc (which would be referenced in the perl code as taskApassesqc)
@@ -307,8 +315,8 @@ human will set that field to something 'true' in perl for that record.  If not, 
 taskA_passes_qc field is left blank (false).  taskB and taskC are modified to depend on
 taskApassesqc instead of taskA.
 
-taskA remains as is (or it could set a field on the spreadsheet to help the human
-QC its result).
+taskA remains as is (or it could add information to field(s) on the spreadsheet to help the
+human QC its result).
 
 modified taskB and taskC simply change their google_agent constructor to have:
 
@@ -359,9 +367,25 @@ is for prioritization.  This will have the key_fields represented, but will not 
 flag, so the normal runner will just skip over all the entries on this page and proceed to
 the next page or pages.  The normal runner can be modified to run less often in cron, while
 the priority runner can run 4 times per hour in cron.  A human can then place things in the
-priority queue that need to run at higher priority than the others, but the normal agent can
+priority queue that need to run at higher priority than the others, but the normal runner can
 still attempt to launch processes that are needing to be run but are not high priority, and
 let the subsumption rules determine whether these can run or not on any given machine.
+
+Basic Runner:
+
+  use Google::Spreadsheet::Agent::Runner;
+
+  # the basic runner should not process the page named priority
+  my $runner = Google::Spreadsheet::Agent::Runner->new('skip_pages' => [ 'priority' ]);
+  $runner->run();
+
+Priority Page Runner:
+
+  use Google::Spreadsheet::Agent::Runner;
+
+  # the priority runner should only process the priority page
+  my $runner = Google::Spreadsheet::Agent::Runner->new('only_pages' => [ 'priority' ]);
+  $runner->run();
 
 WHY NOT AN RDBMS?
 
@@ -369,7 +393,8 @@ This code is not built on the premise that a google spreadsheet is a suitable re
 for a fully functional RDBMS system.  There are many, many advantages that a proper RDBMS
 has over a google spreadsheet, such as robust transactions, locking, and even querying
 capabilities.  What a google spreadsheet provides is a robust webservice that is available
-to computers and humans alike with high availability, and concurrent editing capabilities.
+worldwide to computers and humans alike with high availability, and concurrent editing
+capabilities.
 To use a proper RDBMS system to duplicate this system, one would also need to write this
 webservice on top of it, which would be much more complicated. That being said,
 it is possible for agents to access an RDBMS before calling the run_my method, and/or
@@ -411,52 +436,45 @@ To install this module, run the following commands:
 TESTING
 
 Most of tests for this module will be skipped unless you configure a test spreadsheet and
-corresponding config/agent.conf.yml (use config/agent.conf.yml.tmpl as a template)
+corresponding config/agent.conf.yml (use config/test.agent.conf.yml.tmpl as a template)
 file to work with it.
 
-The test spreadsheet must have the following fields in it:
-testentry
-ready (this will be set to 1 when the do_not_run_agent.t test runs)
-pass
-fail
-update
-updatevalue
-subsume
-prerequisite
-prerequisitecell
-maxselves
-complete
-
-The agent.conf.yml file will only have one required key_field: testentry,
-but should define email addresses to make sure that the script does not
-die when it fails while not running in debug mode (it will not test whether
-an email was sent).
+The test spreadsheet must have a single page in it, called 'testing', the tests will
+add and remove all other fields and pages that are required to run.  One important thing
+to note is that it is possible that one or more tests will fail simply do to timing issues
+and transient failures when communicating with the Google Spreadsheet service.
+Rerunning the tests that have failed should show that they pass.  It is possible to run
+the entire suite of tests through to completion, but it may take several runs to accomplish.
+For this reason, all tests are skipped on initial installation of the modules using cpan.
+If you are installing into a production system, you can set up the testing config and run
+the tests manually to verify that they everything works.
 
 SUPPORT AND DOCUMENTATION
 
-After installing, you can find documentation for this module with the
+After installing, you can find documentation for its modules with the
 perldoc command.
 
     perldoc Google::Spreadsheet::Agent
+    perldoc Google::Spreadsheet::Agent::Runner
 
 You can also look for information at:
 
     RT, CPAN's request tracker
-        http://rt.cpan.org/NoAuth/Bugs.html?Dist=IGSP-GoogleAgent
+        http://rt.cpan.org/NoAuth/Bugs.html?Dist=Google-Spreadsheet-Agent
 
     AnnoCPAN, Annotated CPAN documentation
-        http://annocpan.org/dist/IGSP-GoogleAgent
+        http://annocpan.org/dist/Google-Spreadsheet-Agent
 
     CPAN Ratings
-        http://cpanratings.perl.org/d/IGSP-GoogleAgent
+        http://cpanratings.perl.org/d/Google-Spreadsheet-Agent
 
     Search CPAN
-        http://search.cpan.org/dist/IGSP-GoogleAgent/
+        http://search.cpan.org/dist/Google-Spreadsheet-Agent/
 
 
 COPYRIGHT AND LICENCE
 
-Copyright (C) 2009 Darin London
+Copyright (C) 2010 Darin London
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of either: the GNU General Public License as published

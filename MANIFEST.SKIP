@@ -6,3 +6,4 @@
 ^MANIFEST\.SKIP$
 ^config\/agent\.conf\.yml$
 .svn
+^MYMETA.yml$

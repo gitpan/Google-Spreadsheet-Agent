@@ -1,27 +1,15 @@
 package Google::Spreadsheet::Agent;
 
-use FindBin;
-use YAML::Any qw/LoadFile/;
-use Net::Google::Spreadsheets;
 use Net::SMTP::TLS;
 use IO::CaptureOutput qw/capture/;
 use Sys::Hostname;
 use Moose;
 use Carp;
+use File::Basename;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
-sub BUILD {
-    my $self = shift;
-
-    my @required_key_fields = grep { $self->config->{key_fields}->{$_}->{required} } keys %{$self->config->{key_fields}};
-    die ("Your configuration must have at least one required key_fields key!\n") unless (@required_key_fields);
-
-    foreach my $required_query_field (@required_key_fields) {
-        croak ("You must provide a bind_key_fields ${required_query_field} key - value pair!\n")
-          unless ($self->bind_key_fields->{$required_query_field});
-    }
-}
+extends ('Google::Spreadsheet::Agent::DB');
 
 has 'bind_key_fields' => (
                             is => 'ro',
@@ -55,46 +43,24 @@ has 'max_selves' => (
                      isa => 'Int'
                      );
 
-has 'subsumed_by' => (
+has 'conflicts_with' => (
                       is => 'ro',
                       isa => 'HashRef'
                       );
-
-has 'config_file' => (
-                      is => 'ro',
-                      isa => 'Str',
-                      );
-
-has 'config' => (
-                 is => 'ro',
-                 builder => '_build_config'
-                 );
-
-has 'google_db' => (
-                    is => 'ro',
-                    builder => '_build_google_db',
-                    lazy => 1, # depends on config
-                    init_arg => undef # google_db cannot be overridden
-                    );
+has 'subsumes' => (
+                   is => 'ro',
+                   isa => 'ArrayRef'
+                   );
 
 #### BUILDERS
-
-sub _build_config {
+sub BUILD {
     my $self = shift;
-    my $config_file = $self->config_file || $FindBin::Bin.'/../config/agent.conf.yml';
-    croak "Config ${config_file} not found!\n" unless (-e $config_file);
-    return YAML::Any::LoadFile($config_file);
-}
 
-sub _build_google_db {
-    my $self = shift;
-    my $service = Net::Google::Spreadsheets->new(
-                                                 username => $self->config->{guser},
-                                                 password => $self->config->{gpass},
-                                                 );
-    return $service->spreadsheet({
-        title => $self->config->{spreadsheet_name}
-    });
+    my @required_key_fields = grep { $self->config->{key_fields}->{$_}->{required} } keys %{$self->config->{key_fields}};
+    foreach my $required_query_field (@required_key_fields) {
+        croak ("You must provide a bind_key_fields ${required_query_field} key - value pair!\n")
+          unless ($self->bind_key_fields->{$required_query_field});
+    }
 }
 
 #### METHODS
@@ -106,7 +72,7 @@ around 'run_my' => sub {
         return $self->$orig(@args);
     }
     else {
-        my $capture_output;
+        my ($capture_output, $capture_error);
         my $no_problems = capture {
             my $ret;
             eval {
@@ -117,15 +83,18 @@ around 'run_my' => sub {
                 return;
             }
             return $ret;
-        } \$capture_output, \$capture_output;
-        $self->mail_error($capture_output) unless ($no_problems);
+        } \$capture_output, \$capture_error;
+
+        if (!$no_problems && ($capture_output || $capture_error)) {
+            $self->mail_error("Output:\n${capture_output}\nError:\n${capture_error}\n");
+        }
         return $no_problems;
     }
 };
 
 sub run_my {
     my ($self, $agent_code) = @_;
-    return 1 if ($self->is_subsumed);
+    return 1 if ($self->has_conflicts);
     my $entry = $self->run_entry();
     
     return unless ($entry);
@@ -142,52 +111,54 @@ sub run_my {
     }
 }
 
-sub is_subsumed {
+sub has_conflicts {
     my $self = shift;
 
-    return unless ($self->max_selves || $self->subsumed_by); # nothing to subsume here
+    return unless ($self->max_selves || $self->conflicts_with); # nothing conflicts here
 
-    my $subsumed;
-    my %running_subsumers;
+    my $has_conflicts;
+    my %running_conflicters;
 
-    my $subsume_opened = open (my $subsuming_in, '-|', 'ps', '-eo', 'pid,command');
-    unless ($subsume_opened) {
-        print STDERR "Couldnt check subsumption $!\n";
-        return 1; # subsume to be safe
+    my $self_name = File::Basename::basename($0);
+
+    my $conflict_search_open = open (my $conflicting_in, '-|', 'ps', '-eo', 'pid,command');
+    unless ($conflict_search_open) {
+        print STDERR "Couldnt check conflicts $!\n";
+        return 1; # conflict to be safe
     }
 
-    SUBIN: while (my $in = <$subsuming_in>) {
+    CONFIN: while (my $in = <$conflicting_in>) {
         next if ($in =~ m/emacs|vi|screen|SCREEN/); # skip editing and screen
         next if ($in =~ m/\s*$$/); # skip this agent
         next if ($in =~ m/(\[|\])/); # skip daemons
 
-        my $self_name = $self->agent_name;
+
         if ($self->max_selves 
             && $in =~ m/$self_name/) {
-            $running_subsumers{$self->agent_name}++;
-            if ($running_subsumers{$self->agent_name} == $self->max_selves) {
+            $running_conflicters{$self->agent_name}++;
+            if ($running_conflicters{$self->agent_name} == $self->max_selves) {
                 print STDERR "max_selves limit reached\n";
-                $subsumed = 1;
-                last SUBIN;
+                $has_conflicts = 1;
+                last CONFIN;
             }
         }
 
-        if ($self->subsumed_by) {
-            foreach my $subsumer (keys %{$self->subsumed_by}) {
-                if ($in =~ m/$subsumer/) {
-                    $running_subsumers{$subsumer}++;
-                    if ($running_subsumers{$subsumer} == $self->subsumed_by->{$subsumer}) {
-                        print STDERR "subsumed by ${subsumer}\n";
-                        $subsumed = 1;
-                        last SUBIN;
+        if ($self->conflicts_with) {
+            foreach my $conflicter (keys %{$self->conflicts_with}) {
+                if ($in =~ m/$conflicter/) {
+                    $running_conflicters{$conflicter}++;
+                    if ($running_conflicters{$conflicter} == $self->conflicts_with->{$conflicter}) {
+                        print STDERR "conflicts with ${conflicter}\n";
+                        $has_conflicts = 1;
+                        last CONFIN;
                     }
                 }
             }
         }
     }
-    close $subsuming_in;
+    close $conflicting_in;
 
-    return $subsumed;
+    return $has_conflicts;
 }
 
 sub get_entry {
@@ -204,7 +175,7 @@ sub get_entry {
     # a limitation of the Google API rather than Net::Google::Spreadsheets
     # as it appeared that Net::Google::Spreadsheets was submitting valid,
     # url encoded queries that the Google system rejected. Instead this software
-    # conducts a full table scan to ensure the correct row is returned
+    # conducts a full worksheet scan to ensure the correct row is returned
     if ($worksheet) {
         my @rows = $worksheet->rows();
         ROW: foreach my $row (@rows) {
@@ -223,8 +194,9 @@ sub get_entry {
     return $entry;
 }
 
-# this call initiates a race resistant attempt to make sure that there is only 1 clear 'winner' among N potential
-# agents attempting to run the same goal on the same spreadsheet agent's cell
+# this call initiates a race resistant attempt to make sure that there is only 1
+# clear 'winner' among N potential agents attempting to run the same goal on the
+# same spreadsheet agent's cell
 sub run_entry {
     my $self = shift;
 
@@ -237,34 +209,34 @@ sub run_entry {
     }
 
     unless ($entry) {
-        print STDERR $output." is not supported on ".$self->page_name."\n";
+        print STDERR $output." is not supported on ".$self->page_name."\n" if ($self->debug);
         return;
     }
 
     unless ($entry->content->{ready}) {
-        print STDERR $output." is not ready to run ".$self->agent_name."\n";
+        print STDERR $output." is not ready to run ".$self->agent_name."\n" if ($self->debug);
         return {'not_runnable' => 1};
     }
 
     if ($entry->content->{complete}) {
-        print STDERR "All goals are completed for ".$output."\n";
+        print STDERR "All goals are completed for ".$output."\n" if ($self->debug);
         return {'not_runnable' => 1};
     }
 
     if ($entry->content->{$self->agent_name}) {
         my ($status, $running_hostname) = split /\:/, $entry->content->{$self->agent_name};
         if ($status eq 'r') {
-            print STDERR $output." is already running ".$self->agent_name." on ${running_hostname}\n";
+            print STDERR $output." is already running ".$self->agent_name." on ${running_hostname}\n" if ($self->debug);
             return {'not_runnable' => 1};
         }
         
         if ($status == 1) {
-            print STDERR $output." has already run ".$self->agent_name."\n";
+            print STDERR $output." has already run ".$self->agent_name."\n" if ($self->debug);
             return {'not_runnable' => 1};
         }
 
         if ($status eq 'F') {
-            print STDERR $output." has already Failed ".$self->agent_name." on a previous run and must be investigated on ${running_hostname}\n";
+            print STDERR $output." has already Failed ".$self->agent_name." on a previous run and must be investigated on ${running_hostname}\n" if ($self->debug);
             return {'not_runnable' => 1};
         }
     }
@@ -272,19 +244,16 @@ sub run_entry {
     if ($self->prerequisites) {
         foreach my $prereq_field (@{$self->prerequisites}) {
             unless ($entry->content->{$prereq_field} == 1) {
-                print STDERR $output." has not finished ${prereq_field}\n";
+                print STDERR $output." has not finished ${prereq_field}\n" if ($self->debug);
                 return {'not_runnable' => 1};
             }
         }
     }
 
-    my $content = $entry->content;
-
     # first attempt to set the hostname of the machine as the value of the agent
     my $hostname = Sys::Hostname::hostname;
-    $content->{$self->agent_name} = 'r:'.$hostname;
     eval { 
-        $entry->content($content); 
+        $entry->param({ $self->agent_name => 'r:'.$hostname }); 
     };
     if ($@) {
         # this is a collision, which is to be treated as if it is not runnable
@@ -316,16 +285,14 @@ sub fail_entry {
 
     my $entry = $self->get_entry();
     my $hostname = Sys::Hostname::hostname;
-    my $content = $entry->content;
     if ($update_entry) {
         print STDERR "Updating entry\n";
-        foreach my $key (keys %{$update_entry}) {
-            $content->{$key} = $update_entry->{$key};
-        }
     }
-
-    $content->{$self->agent_name} = 'F:'.$hostname;
-    $entry->content($content);
+    else {
+        $update_entry = {};
+    }
+    $update_entry->{$self->agent_name} = 'F:'.$hostname;
+    $entry->param($update_entry);
 }
 
 sub complete_entry {
@@ -334,15 +301,21 @@ sub complete_entry {
 
     print STDERR "All Complete\n";
     my $entry = $self->get_entry();
-    my $content = $entry->content;
     if ($update_entry) {
         print STDERR "Updating entry\n";
-        foreach my $key (keys %{$update_entry}) {
-            $content->{$key} = $update_entry->{$key};
+    }
+    else {
+        $update_entry = {};
+    }
+
+    if ($self->subsumes) {
+        foreach my $subsumed_agent (@{$self->subsumes}) {
+            $update_entry->{$subsumed_agent} = 1;
         }
     }
-    $content->{$self->agent_name} = 1;
-    $entry->content($content);
+
+    $update_entry->{$self->agent_name} = 1;
+    $entry->param($update_entry);
 }
 
 sub mail_error {
@@ -379,7 +352,7 @@ Google::Spreadsheet::Agent - A Distributed Agent System using Google Spreadsheet
 
 =head1 VERSION
 
-Version 0.01
+Version 0.02
 
 =head1 SYNOPSIS
 
@@ -394,10 +367,11 @@ Version 0.01
                                                'foo' => 'this_particular_foo'
                                           },
                                           prerequisites => [ 'isitdone', 'isthisone' ],
-                                          subsumed_by => {
+                                          conflicts_with => {
                                                            'someother_agent.pl' => 3,
                                                            'someother_process' => 1
-                                                         }
+                                                         },
+                                          subsumes => [ 'someothertask' ],
                                           );
 
   $google_agent->run_my(sub {
@@ -426,31 +400,14 @@ Version 0.01
   for other goals, but it does provide logic for easily defining these relationships
   based on your own needs.  It does this by providing a subsumption architecture,
   whereby many small, highly focused agents are written to perform specific goals,
-  and also know what resources they require to perform them.  In addition, it is
+  and also know what resources they require to perform them.  Agents can be coded to
+  subsume other agents upon successful completion.  In addition, it is
   designed from the beginning to support the creation of simple human-computational
   workflows.
 
 =head1 CONFIGURATION
 
-  Scripts which use Google::Spreadsheet::Agents must supply the appropriate
-  configuration for it to work.  This can be done one of two ways.
-
-=over 2
-
-=item YAML file supplied as config_file constructor argument.
-
-  This is the easiest way to configure a set of agents using the same configuration.
-  See config/agent.conf.yml.tmpl for a template, with documentation, of what needs
-  to be defined.
-
-=item HashRef supplied as config constructor argument.
-
-  You can define a HashRef with all of the key-value pairs defined in config/agent.conf.yml.tmpl
-  and pass that to the constructor.  This may be more useful where you want to use other serialization
-  systems (e.g. JSON, XML, etc) to store configuration, which can be manipulated into a HashRef to
-  be passed into the constructor.
-
-=back
+See L<Google::Spreadsheet::Agent::DB> for information about how to configure your Agent. 
 
 =head1 METHODS
 
@@ -469,15 +426,16 @@ Version 0.01
 
  required:
   agent_name => Str
-  config || config_file (you must supply configuration)
   page_name => Str
   bind_key_fields => HashRef { key_field_name => bound_value, ... }
 
  optional:
   prerequisites => []
+  config || config_file
   debug => Bool
   max_selves => Int
-  subsumed_by => { process_name => max_allowed, ... }
+  conflicts_with => { process_name => max_allowed, ... }
+  subsumes => []
 
   This method will throw an exception if bind_key_fields are
   not supplied for required key_fields, as specified in the
@@ -492,7 +450,7 @@ Version 0.01
   This method takes a subroutine codeRef as an argument.  It then checks to determine
   if the agent needs to run for the given bind_key_field(s) specified row (it must
   have a 1 in the 'ready' field for the row, and the agent_name field must be empty),
-  whether any prerequisite fields are true, whether the agent is subsumed by something
+  whether any prerequisite fields are true, whether the agent conflicts with something
   else running on the machine, and whether there are not already max_selves other
   instances of the agent running on the machine.  If all of these are true, it then
   attempts to fill its hostname into the field for the agent_name.  If it succeeds,
@@ -506,20 +464,24 @@ Version 0.01
 =item return true
 
   This instructs Google::Spreadsheet::Agent to place a 1 (true) value in the field for the agent on
-  the spreadsheet, signifying that it has been completed.
+  the spreadsheet, signifying that it has completed successfully.  If the agent subsumes other agents,
+  the fields for these agents will also be set to 1.
 
 =item return false
 
   This instructs Google::Spreadsheet::Agent to place F:hostname into the field for the agent on the
   spreadsheet, signifying that it has failed.  It will not run again for this job until the
-  failure is cleared from the spreadsheet (by any other agent).
+  failure is cleared from the spreadsheet (by any other agent).  Subsumed agent fields are left
+  as is.
 
 =item return (true|false, HashRef)
 
   This does what returning true or false does, as well as allowing specific fields in the 
   spreadsheet to also be modified by the calling code.  The HashRef should contain keys
   only for those fields to be updated (it should not attempt to update the field for the
-  agent_name itself, as this will be ignored).
+  agent_name itself, as this will be ignored).  Note, the fields for subsumed agents will
+  be set to 1 when the agent is successfull, overriding any values passed for these fields
+  in the returned HashRef, so it is best not to set these fields when returning 1 (success).
 
 =back
 
@@ -540,12 +502,6 @@ Version 0.01
 =head2 debug
 
  This returns the debug state specified in the constructor.
-
-=head2 google_db
-
- This returns the actual Net::Google::Spreadsheet object used
- by the agent, in case other types of queries, or modifications
- need to be made that do not fit within this system.
 
 =head1 AUTHOR
 
@@ -580,6 +536,8 @@ L<http://annocpan.org/dist/Google-Spreadsheet-Agent>
 
 =head1 SEE ALSO
 
+L<Google::Spreadsheet::Agent::DB>
+L<Google::Spreadsheet::Agent::Runner>
 L<Net::Google::Spreadsheets>
 L<Moose>
 
